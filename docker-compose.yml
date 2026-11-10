@@ -1,0 +1,111 @@
+name: payment-service
+
+x-app: &app
+  build: .
+  image: payment-service:local
+  restart: unless-stopped
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+    RABBITMQ_URL: amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-payments}
+    ports:
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      API_KEY: ${API_KEY:-dev-api-key-change-me}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  outbox-relay:
+    <<: *app
+    command: ["faststream", "run", "--factory", "app.outbox.main:create_app"]
+    environment:
+      <<: *app-env
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-0.5}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "--factory", "app.worker.main:create_app"]
+    stop_grace_period: 40s
+    environment:
+      <<: *app-env
+      CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-20}
+      RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+      RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2}
+      WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-5}
+      GATEWAY_MIN_DELAY: ${GATEWAY_MIN_DELAY:-2}
+      GATEWAY_MAX_DELAY: ${GATEWAY_MAX_DELAY:-5}
+      GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  webhook-receiver:
+    <<: *app
+    command: ["uvicorn", "app.devtools.webhook_receiver:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "${WEBHOOK_RECEIVER_PORT:-8080}:8080"
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
